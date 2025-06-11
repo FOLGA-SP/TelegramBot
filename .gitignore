@@ -1,0 +1,22 @@
+docs/
+
+## Cursor
+.cursorrules
+.cursorignore
+
+## Python
+.venv/
+__pycache__/
+
+## Environment variables
+.env
+
+## Temporary credentials file
+google_credentials_base64.txt
+
+## Render
+render.yaml
+
+## Logs
+
+*.log
