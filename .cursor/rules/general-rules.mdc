@@ -1,0 +1,18 @@
+---
+alwaysApply: true
+---
+
+## Project Overview
+
+A multilingual Telegram bot designed to streamline the recruitment process for foreign workers in Poland. The bot facilitates job applications and candidate inquiries through an intuitive interface available in Polish, Ukrainian, and Russian languages. Bot name is RobotaVPolshchiBot.
+
+## Tech Stack
+
+- Python 3.13
+- python-telegram-bot library
+- python-dotenv library
+- Google Sheets API
+
+## Deployment
+
+The bot is deployed on Render as a background worker.
