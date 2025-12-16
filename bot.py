@@ -4,7 +4,13 @@ import json
 import base64
 import re
 import asyncio
+import hashlib
+import socket
+import contextlib
 from typing import Optional
+from collections import defaultdict
+from time import time
+from enum import Enum
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
@@ -25,6 +31,12 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Reduce risk of bot token exposure in logs (e.g., httpx request URLs include the token).
+# Keep PTB/app logs at INFO, but mute HTTP client verbosity unless explicitly needed.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.INFO)
+logging.getLogger("telegram.ext").setLevel(logging.INFO)
 
 # Validate required environment variables
 REQUIRED_ENV_VARS = [
@@ -51,7 +63,6 @@ def validate_environment():
 validate_environment()
 
 # Configuration from environment variables
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 APPLICATIONS_SHEET_NAME = os.getenv("APPLICATIONS_SHEET_NAME", "Applications")
 CONTACTS_SHEET_NAME = os.getenv("CONTACTS_SHEET_NAME", "Contacts")
@@ -65,6 +76,81 @@ NAME_PATTERN = re.compile(r'^[a-zA-ZąćęłńóśźżĄĆĘŁŃÓŚŹŻіїєІ
 
 # Global Google Sheets client (connection pooling)
 google_client = None
+_google_client_lock = asyncio.Lock()
+
+# Rate limiting
+_user_last_action = defaultdict(float)
+RATE_LIMIT_SECONDS = 1
+
+def anonymize_user_id(user_id) -> str:
+    """Hash user ID for GDPR-compliant logging."""
+    return hashlib.sha256(str(user_id).encode()).hexdigest()[:8]
+
+def get_bot_token() -> str:
+    """Get bot token on-demand to minimize exposure window."""
+    return os.getenv("TELEGRAM_BOT_TOKEN")
+
+
+@contextlib.contextmanager
+def single_instance_lock():
+    """
+    Best-effort single-instance guard.
+    Uses a localhost TCP port bind to ensure only one bot process runs at a time.
+
+    Controlled via env:
+    - BOT_SINGLE_INSTANCE_LOCK: '1' (default) enables, '0' disables
+    - BOT_LOCK_PORT: port number (default 17500)
+    """
+    enabled = os.getenv("BOT_SINGLE_INSTANCE_LOCK", "1").strip().lower() not in {"0", "false", "no", "off"}
+    if not enabled:
+        yield None
+        return
+
+    port_str = os.getenv("BOT_LOCK_PORT", "17500").strip()
+    try:
+        port = int(port_str)
+    except ValueError:
+        logger.warning(f"Invalid BOT_LOCK_PORT={port_str!r}; falling back to 17500")
+        port = 17500
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # Reuse is safe here: we want bind() to fail if another instance is currently listening/bound.
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("127.0.0.1", port))
+        sock.listen(1)
+    except OSError:
+        logger.error(
+            f"Another instance of the bot appears to be running (lock port {port} is in use). "
+            f"Stop the other process or set BOT_SINGLE_INSTANCE_LOCK=0 to disable the guard."
+        )
+        raise SystemExit(2)
+
+    try:
+        yield sock
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+async def check_rate_limit(user_id: int) -> bool:
+    """Check if user is within rate limit. Returns True if allowed, False if rate limited."""
+    now = time()
+    if now - _user_last_action[user_id] < RATE_LIMIT_SECONDS:
+        return False
+    _user_last_action[user_id] = now
+    return True
+
+# Form step enum to replace magic strings
+class FormStep(Enum):
+    NAME = 'name'
+    COUNTRY = 'country'
+    PHONE = 'phone'
+    TELEGRAM_PHONE = 'telegram_phone'
+    ACCOMMODATION = 'accommodation'
+    CITY = 'city'
+    AVAILABILITY = 'availability'
 
 # Translation dictionary
 TRANSLATIONS = {
@@ -241,10 +327,13 @@ def sanitize_input(value: str) -> str:
     """Sanitize user input for safe storage."""
     if not value:
         return ""
-    
-    # Remove any potentially harmful characters
-    sanitized = re.sub(r'[<>"\']', '', value.strip())
-    return sanitized[:500]  # Limit length
+    # Remove control characters and null bytes
+    sanitized = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', value.strip())
+    # Remove potentially harmful characters
+    sanitized = re.sub(r'[<>"\'\\\x00]', '', sanitized)
+    # Normalize whitespace
+    sanitized = ' '.join(sanitized.split())
+    return sanitized[:500]
 
 # Google Sheets integration with connection pooling
 async def get_google_credentials():
@@ -269,15 +358,17 @@ async def setup_google_sheets() -> Optional[gspread.Spreadsheet]:
     global google_client
     
     try:
-        if google_client is None:
-            creds = await get_google_credentials()
-            google_client = gspread.authorize(creds)
-            logger.info("Google Sheets client initialized")
+        async with _google_client_lock:
+            if google_client is None:
+                creds = await get_google_credentials()
+                google_client = await asyncio.to_thread(gspread.authorize, creds)
+                logger.info("Google Sheets client initialized")
         
-        return google_client.open_by_key(SHEET_ID)
+        return await asyncio.to_thread(google_client.open_by_key, SHEET_ID)
     except Exception as e:
         logger.error(f"Error setting up Google Sheets: {e}")
-        google_client = None  # Reset client on error
+        async with _google_client_lock:
+            google_client = None  # Reset client on error
         return None
 
 # Job description loading functions
@@ -365,7 +456,7 @@ def format_job_description_for_telegram(content: str, language: str) -> str:
                 
             # Handle horizontal rules (---)
             elif line.strip() == '---':
-                formatted_lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                formatted_lines.append("━━━━━")
                 formatted_lines.append("")  # Add spacing
                 
             # Handle main bullet points
@@ -390,7 +481,6 @@ def format_job_description_for_telegram(content: str, language: str) -> str:
         result = '\n'.join(formatted_lines)
         
         # Replace multiple consecutive newlines with maximum 2
-        import re
         result = re.sub(r'\n{3,}', '\n\n', result)
         
         # Add some final formatting touches
@@ -452,9 +542,11 @@ async def load_job_description(job_title: str, language: str) -> Optional[str]:
             logger.error(f"No mapping found for job '{job_title}' in language '{language}'")
             return None
         
-        # Read and parse the markdown file
-        with open(file_path, 'r', encoding='utf-8') as file:
-            content = file.read()
+        # Read and parse the markdown file (non-blocking)
+        def read_file():
+            with open(file_path, 'r', encoding='utf-8') as file:
+                return file.read()
+        content = await asyncio.to_thread(read_file)
         
         # Find the section for this job
         sections = content.split('\n# ')
@@ -514,6 +606,49 @@ def create_keyboard(buttons, lang):
         # Return basic keyboard as fallback
         return ReplyKeyboardMarkup([[KeyboardButton("Menu")]], resize_keyboard=True)
 
+async def process_form_step(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    current_step: FormStep,
+    next_step: Optional[FormStep],
+    validation_type: str,
+    error_key: str,
+    next_prompt_key: str,
+    form_data_key: str,
+    return_state: int,
+    keyboard_options: Optional[list] = None
+) -> tuple[bool, int]:
+    """
+    Process a single form step with validation and state management.
+    Returns (success, next_state) tuple.
+    """
+    lang = context.user_data.get('language', 'pl')
+    text = update.message.text
+    form_data = context.user_data.get('form_data', {})
+    
+    if not validate_input(validation_type, text):
+        await update.message.reply_text(get_text(lang, error_key))
+        return False, return_state
+    
+    form_data[form_data_key] = sanitize_input(text)
+    context.user_data['form_data'] = form_data
+    
+    if next_step:
+        context.user_data['form_step'] = next_step.value
+        
+        if keyboard_options:
+            keyboard = keyboard_options
+        else:
+            keyboard = [[get_text(lang, 'cancel')]]
+        
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        await update.message.reply_text(
+            get_text(lang, next_prompt_key),
+            reply_markup=reply_markup
+        )
+    
+    return True, return_state
+
 async def handle_error(update: Update, context: ContextTypes.DEFAULT_TYPE, error_msg: str = None) -> int:
     """Handle errors gracefully and return to main menu."""
     try:
@@ -521,7 +656,7 @@ async def handle_error(update: Update, context: ContextTypes.DEFAULT_TYPE, error
         message = error_msg or get_text(lang, 'error_occurred')
         
         await update.message.reply_text(message)
-        logger.error(f"Error handled for user {update.effective_user.id}: {error_msg}")
+        logger.error(f"Error handled for user {anonymize_user_id(update.effective_user.id)}: {error_msg}")
         
         return await show_main_menu(update, context)
     except Exception as e:
@@ -532,8 +667,13 @@ async def handle_error(update: Update, context: ContextTypes.DEFAULT_TYPE, error
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the conversation. If language is set, show main menu, otherwise ask for language."""
     try:
-        lang = context.user_data.get('language')
         user_id = update.effective_user.id
+        
+        # Apply rate limiting
+        if not await check_rate_limit(user_id):
+            return context.user_data.get('current_state', LANGUAGE_SELECTION)
+        
+        lang = context.user_data.get('language')
         username = update.effective_user.username or "Unknown"
 
         if lang:
@@ -654,11 +794,19 @@ async def job_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 ]
                 reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
                 
-                await update.message.reply_text(
-                    job_description,
-                    reply_markup=reply_markup,
-                    parse_mode='Markdown'
-                )
+                # Try Markdown first, fallback to plain text if parsing fails
+                try:
+                    await update.message.reply_text(
+                        job_description,
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    # Fallback to plain text if Markdown parsing fails
+                    await update.message.reply_text(
+                        job_description,
+                        reply_markup=reply_markup
+                    )
                 return JOB_DESCRIPTION
             else:
                 # Fallback if job description not found
@@ -694,7 +842,7 @@ async def job_description_handler(update: Update, context: ContextTypes.DEFAULT_
         elif text == get_text(lang, 'apply_for_job'):
             # Start application form
             context.user_data['form_data'] = {}
-            context.user_data['form_step'] = 'name'
+            context.user_data['form_step'] = FormStep.NAME.value
             context.user_data['user_id'] = update.effective_user.id
             
             keyboard = [[get_text(lang, 'cancel')]]
@@ -723,55 +871,55 @@ async def job_application_handler(update: Update, context: ContextTypes.DEFAULT_
         form_step = context.user_data.get('form_step')
         form_data = context.user_data.get('form_data', {})
         
-        if form_step == 'name':
+        if form_step == FormStep.NAME.value:
             if not validate_input('name', text):
                 await update.message.reply_text(get_text(lang, 'invalid_name'))
                 return JOB_APPLICATION
             
             form_data['name'] = sanitize_input(text)
-            context.user_data['form_step'] = 'country'
+            context.user_data['form_step'] = FormStep.COUNTRY.value
             await update.message.reply_text(get_text(lang, 'enter_country'))
         
-        elif form_step == 'country':
+        elif form_step == FormStep.COUNTRY.value:
             if not validate_input('country', text):
                 await update.message.reply_text(get_text(lang, 'invalid_input'))
                 return JOB_APPLICATION
             
             form_data['country'] = sanitize_input(text)
-            context.user_data['form_step'] = 'phone'
+            context.user_data['form_step'] = FormStep.PHONE.value
             await update.message.reply_text(get_text(lang, 'enter_phone'))
         
-        elif form_step == 'phone':
+        elif form_step == FormStep.PHONE.value:
             if not validate_input('phone', text):
                 await update.message.reply_text(get_text(lang, 'invalid_phone'))
                 return JOB_APPLICATION
             
             form_data['phone'] = sanitize_input(text)
-            context.user_data['form_step'] = 'telegram_phone'
+            context.user_data['form_step'] = FormStep.TELEGRAM_PHONE.value
             await update.message.reply_text(get_text(lang, 'enter_telegram_phone'))
         
-        elif form_step == 'telegram_phone':
+        elif form_step == FormStep.TELEGRAM_PHONE.value:
             if not validate_input('phone', text):
                 await update.message.reply_text(get_text(lang, 'invalid_phone'))
                 return JOB_APPLICATION
             
             form_data['telegram_phone'] = sanitize_input(text)
-            context.user_data['form_step'] = 'accommodation'
+            context.user_data['form_step'] = FormStep.ACCOMMODATION.value
             
-            keyboard = [[get_text(lang, 'yes'), get_text(lang, 'no')]]
+            keyboard = [[get_text(lang, 'yes'), get_text(lang, 'no')], [get_text(lang, 'cancel')]]
             reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
             await update.message.reply_text(
                 get_text(lang, 'enter_accommodation'),
                 reply_markup=reply_markup
             )
         
-        elif form_step == 'accommodation':
+        elif form_step == FormStep.ACCOMMODATION.value:
             if not validate_input('accommodation', text):
                 await update.message.reply_text(get_text(lang, 'invalid_input'))
                 return JOB_APPLICATION
             
             form_data['accommodation'] = sanitize_input(text)
-            context.user_data['form_step'] = 'city'
+            context.user_data['form_step'] = FormStep.CITY.value
             
             keyboard = [[get_text(lang, 'cancel')]]
             reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -780,7 +928,7 @@ async def job_application_handler(update: Update, context: ContextTypes.DEFAULT_
                 reply_markup=reply_markup
             )
         
-        elif form_step == 'city':
+        elif form_step == FormStep.CITY.value:
             if not validate_input('city', text):
                 await update.message.reply_text(get_text(lang, 'invalid_input'))
                 return JOB_APPLICATION
@@ -820,7 +968,7 @@ async def contact_option_handler(update: Update, context: ContextTypes.DEFAULT_T
     
     elif text == get_text(lang, 'fill_form'):
         context.user_data['form_data'] = {}
-        context.user_data['form_step'] = 'name'
+        context.user_data['form_step'] = FormStep.NAME.value
         context.user_data['user_id'] = update.effective_user.id
         
         keyboard = [[get_text(lang, 'cancel')]]
@@ -855,50 +1003,50 @@ async def contact_form_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     form_step = context.user_data.get('form_step')
     form_data = context.user_data.get('form_data', {})
     
-    if form_step == 'name':
+    if form_step == FormStep.NAME.value:
         if not validate_input('name', text):
             await update.message.reply_text(get_text(lang, 'invalid_name'))
             return CONTACT_FORM
         form_data['name'] = sanitize_input(text)
-        context.user_data['form_step'] = 'country'
+        context.user_data['form_step'] = FormStep.COUNTRY.value
         await update.message.reply_text(get_text(lang, 'enter_country'))
     
-    elif form_step == 'country':
+    elif form_step == FormStep.COUNTRY.value:
         if not validate_input('country', text):
             await update.message.reply_text(get_text(lang, 'invalid_input'))
             return CONTACT_FORM
         form_data['country'] = sanitize_input(text)
-        context.user_data['form_step'] = 'phone'
+        context.user_data['form_step'] = FormStep.PHONE.value
         await update.message.reply_text(get_text(lang, 'enter_phone'))
     
-    elif form_step == 'phone':
+    elif form_step == FormStep.PHONE.value:
         if not validate_input('phone', text):
             await update.message.reply_text(get_text(lang, 'invalid_phone'))
             return CONTACT_FORM
         form_data['phone'] = sanitize_input(text)
-        context.user_data['form_step'] = 'telegram_phone'
+        context.user_data['form_step'] = FormStep.TELEGRAM_PHONE.value
         await update.message.reply_text(get_text(lang, 'enter_telegram_phone'))
     
-    elif form_step == 'telegram_phone':
+    elif form_step == FormStep.TELEGRAM_PHONE.value:
         if not validate_input('phone', text):
             await update.message.reply_text(get_text(lang, 'invalid_phone'))
             return CONTACT_FORM
         form_data['telegram_phone'] = sanitize_input(text)
-        context.user_data['form_step'] = 'accommodation'
+        context.user_data['form_step'] = FormStep.ACCOMMODATION.value
         
-        keyboard = [[get_text(lang, 'yes'), get_text(lang, 'no')]]
+        keyboard = [[get_text(lang, 'yes'), get_text(lang, 'no')], [get_text(lang, 'cancel')]]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         await update.message.reply_text(
             get_text(lang, 'enter_accommodation'),
             reply_markup=reply_markup
         )
     
-    elif form_step == 'accommodation':
+    elif form_step == FormStep.ACCOMMODATION.value:
         if not validate_input('accommodation', text):
             await update.message.reply_text(get_text(lang, 'invalid_input'))
             return CONTACT_FORM
         form_data['accommodation'] = sanitize_input(text)
-        context.user_data['form_step'] = 'availability'
+        context.user_data['form_step'] = FormStep.AVAILABILITY.value
         
         keyboard = [[get_text(lang, 'cancel')]]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -907,7 +1055,7 @@ async def contact_form_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=reply_markup
         )
     
-    elif form_step == 'availability':
+    elif form_step == FormStep.AVAILABILITY.value:
         if not validate_input('availability', text):
             await update.message.reply_text(get_text(lang, 'invalid_input'))
             return CONTACT_FORM
@@ -956,7 +1104,7 @@ async def save_job_application(user_data) -> bool:
             logger.error("Could not connect to Google Sheets")
             return False
         
-        worksheet = sheet.worksheet(APPLICATIONS_SHEET_NAME)
+        worksheet = await asyncio.to_thread(sheet.worksheet, APPLICATIONS_SHEET_NAME)
         
         # Prepare row data for insertion
         form_data = user_data.get('form_data', {})
@@ -974,8 +1122,8 @@ async def save_job_application(user_data) -> bool:
             user_data.get('language', 'pl')
         ]
         
-        worksheet.append_row(row)
-        logger.info(f"Job application saved successfully for user {user_id}")
+        await asyncio.to_thread(worksheet.append_row, row)
+        logger.info(f"Job application saved successfully for user {anonymize_user_id(user_id)}")
         return True
     except Exception as e:
         logger.error(f"Error saving job application: {e}")
@@ -989,7 +1137,7 @@ async def save_contact_form(user_data) -> bool:
             logger.error("Could not connect to Google Sheets")
             return False
         
-        worksheet = sheet.worksheet(CONTACTS_SHEET_NAME)
+        worksheet = await asyncio.to_thread(sheet.worksheet, CONTACTS_SHEET_NAME)
         
         # Prepare row data for insertion
         form_data = user_data.get('form_data', {})
@@ -1006,8 +1154,8 @@ async def save_contact_form(user_data) -> bool:
             user_data.get('language', 'pl')
         ]
         
-        worksheet.append_row(row)
-        logger.info(f"Contact form saved successfully for user {user_id}")
+        await asyncio.to_thread(worksheet.append_row, row)
+        logger.info(f"Contact form saved successfully for user {anonymize_user_id(user_id)}")
         return True
     except Exception as e:
         logger.error(f"Error saving contact form: {e}")
@@ -1104,7 +1252,7 @@ async def startup_checks():
     # Test Telegram token
     try:
         from telegram import Bot
-        bot = Bot(TOKEN)
+        bot = Bot(get_bot_token())
         bot_info = await bot.get_me()
         logger.info(f"✅ Telegram bot connected: @{bot_info.username}")
     except Exception as e:
@@ -1117,112 +1265,120 @@ async def main() -> None:
     """Initialize and start the Telegram bot with comprehensive error handling."""
     application = None
     try:
-        # Run startup checks
-        if not await startup_checks():
-            logger.error("❌ Startup checks failed. Exiting.")
-            return
-        
-        # Create the Application
-        application = Application.builder().token(TOKEN).build()
-        
-        # Configure conversation handler with all states and commands
-        conv_handler = ConversationHandler(
-            entry_points=[
-                CommandHandler('start', start),
-                CommandHandler('menu', menu_command),
-                CommandHandler('language', language_command)
-            ],
-            states={
-                LANGUAGE_SELECTION: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, language_selected),
+        with single_instance_lock():
+            # Run startup checks
+            if not await startup_checks():
+                logger.error("❌ Startup checks failed. Exiting.")
+                return
+
+            # Create the Application
+            application = Application.builder().token(get_bot_token()).build()
+
+            # Configure conversation handler with all states and commands
+            conv_handler = ConversationHandler(
+                entry_points=[
                     CommandHandler('start', start),
                     CommandHandler('menu', menu_command),
+                    CommandHandler('language', language_command)
+                ],
+                states={
+                    LANGUAGE_SELECTION: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, language_selected),
+                        CommandHandler('start', start),
+                        CommandHandler('menu', menu_command),
+                        CommandHandler('contact', contact_command),
+                        CommandHandler('language', language_command)
+                    ],
+                    MAIN_MENU: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, main_menu_handler),
+                        CommandHandler('start', start),
+                        CommandHandler('menu', menu_command),
+                        CommandHandler('contact', contact_command),
+                        CommandHandler('language', language_command)
+                    ],
+                    JOB_SELECTION: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, job_selected),
+                        CommandHandler('start', start),
+                        CommandHandler('menu', menu_command),
+                        CommandHandler('contact', contact_command),
+                        CommandHandler('language', language_command)
+                    ],
+                    JOB_DESCRIPTION: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, job_description_handler),
+                        CommandHandler('start', start),
+                        CommandHandler('menu', menu_command),
+                        CommandHandler('contact', contact_command),
+                        CommandHandler('language', language_command)
+                    ],
+                    JOB_APPLICATION: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, job_application_handler),
+                        CommandHandler('start', start),
+                        CommandHandler('menu', menu_command),
+                        CommandHandler('contact', contact_command),
+                        CommandHandler('language', language_command)
+                    ],
+                    CONTACT_OPTION: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, contact_option_handler),
+                        CommandHandler('start', start),
+                        CommandHandler('menu', menu_command),
+                        CommandHandler('contact', contact_command),
+                        CommandHandler('language', language_command)
+                    ],
+                    CONTACT_FORM: [
+                        MessageHandler(filters.TEXT & ~filters.COMMAND, contact_form_handler),
+                        CommandHandler('start', start),
+                        CommandHandler('menu', menu_command),
+                        CommandHandler('contact', contact_command),
+                        CommandHandler('language', language_command)
+                    ],
+                },
+                fallbacks=[
+                    CommandHandler('start', start),
+                    CommandHandler('cancel', cancel),
                     CommandHandler('contact', contact_command),
                     CommandHandler('language', language_command)
                 ],
-                MAIN_MENU: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, main_menu_handler),
-                    CommandHandler('start', start),
-                    CommandHandler('menu', menu_command),
-                    CommandHandler('contact', contact_command),
-                    CommandHandler('language', language_command)
-                ],
-                JOB_SELECTION: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, job_selected),
-                    CommandHandler('start', start),
-                    CommandHandler('menu', menu_command),
-                    CommandHandler('contact', contact_command),
-                    CommandHandler('language', language_command)
-                ],
-                JOB_DESCRIPTION: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, job_description_handler),
-                    CommandHandler('start', start),
-                    CommandHandler('menu', menu_command),
-                    CommandHandler('contact', contact_command),
-                    CommandHandler('language', language_command)
-                ],
-                JOB_APPLICATION: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, job_application_handler),
-                    CommandHandler('start', start),
-                    CommandHandler('menu', menu_command),
-                    CommandHandler('contact', contact_command),
-                    CommandHandler('language', language_command)
-                ],
-                CONTACT_OPTION: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, contact_option_handler),
-                    CommandHandler('start', start),
-                    CommandHandler('menu', menu_command),
-                    CommandHandler('contact', contact_command),
-                    CommandHandler('language', language_command)
-                ],
-                CONTACT_FORM: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, contact_form_handler),
-                    CommandHandler('start', start),
-                    CommandHandler('menu', menu_command),
-                    CommandHandler('contact', contact_command),
-                    CommandHandler('language', language_command)
-                ],
-            },
-            fallbacks=[
-                CommandHandler('start', start),
-                CommandHandler('cancel', cancel),
-                CommandHandler('contact', contact_command),
-                CommandHandler('language', language_command)
-            ],
-        )
-        
-        application.add_handler(conv_handler)
-        
-        # Add error handler for uncaught exceptions
-        async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-            """Log the error and send a telegram message to notify the developer."""
-            logger.error(f"Exception while handling an update: {context.error}")
-            
-            if update and hasattr(update, 'effective_user') and update.effective_user:
-                try:
-                    await context.bot.send_message(
-                        chat_id=update.effective_user.id,
-                        text="Wystąpił nieoczekiwany błąd. Spróbuj ponownie za chwilę."
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to send error message to user: {e}")
-        
-        application.add_error_handler(error_handler)
-        
-        logger.info("🤖 Bot is starting polling...")
-        
-        # Initialize and start the application manually for proper async handling
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-            poll_interval=1.0,
-            timeout=10
-        )
-        
-        # Keep the bot running until interrupted
-        await asyncio.Future()
+                conversation_timeout=600,  # 10 minutes timeout for form sessions
+            )
+
+            application.add_handler(conv_handler)
+
+            # Add error handler for uncaught exceptions
+            async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+                """Log the error and send a telegram message to notify the developer."""
+                logger.error(f"Exception while handling an update: {context.error}")
+
+                if update and hasattr(update, 'effective_user') and update.effective_user:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=update.effective_user.id,
+                            text="Wystąpił nieoczekiwany błąd. Spróbuj ponownie za chwilę."
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to send error message to user: {e}")
+
+            application.add_error_handler(error_handler)
+
+            # Defensive: ensure webhook mode isn't active (mixed mode can cause confusion).
+            try:
+                await application.bot.delete_webhook(drop_pending_updates=True)
+            except Exception as e:
+                logger.warning(f"Could not delete webhook (continuing): {e}")
+
+            logger.info("🤖 Bot is starting polling...")
+
+            # Initialize and start the application manually for proper async handling
+            await application.initialize()
+            await application.start()
+            await application.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+                poll_interval=1.0,
+                timeout=10
+            )
+
+            # Keep the bot running until interrupted
+            await asyncio.Future()
         
     except KeyboardInterrupt:
         logger.info("🛑 Bot stopped by user")

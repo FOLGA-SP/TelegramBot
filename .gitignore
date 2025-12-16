@@ -1,5 +1,3 @@
-docs/
-
 ## Cursor
 .cursorrules
 .cursorignore
@@ -14,9 +12,5 @@ __pycache__/
 ## Temporary credentials file
 google_credentials_base64.txt
 
-## Render
-render.yaml
-
 ## Logs
-
 *.log
