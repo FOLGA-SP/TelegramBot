@@ -156,7 +156,7 @@
 - **Stawka 36,00 zł brutto** za godzinę (umowa zlecenie)  
 - **Premie** za efektywność pracy i wyniki  
 - **Bezpłatne obiady**  
-- **Zakwaterowanie**: opłata za rachunki 400 zł z bezpłatnym dowozem do pracy  
+- **Zakwaterowanie**: opłata za rachunki 550 zł z bezpłatnym dowozem do pracy  
 - **Dopłata 1,00 zł brutto** do każdej godziny przy własnym zakwaterowaniu  
 - **Dopłata 0,40 zł brutto** do każdej godziny za własny dojazd do pracy  
 - **Możliwość dalszego rozwoju** w strukturach firmy (do starszego Brygadzisty, Koordynatora)  
