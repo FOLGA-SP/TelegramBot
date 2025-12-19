@@ -17,7 +17,7 @@
 
 ## What we can offer you
 
-- **Rate from 33.00 PLN gross** per hour (contract of mandate)  
+- **Rate from 34.00 PLN gross** per hour (contract of mandate)  
 - Work in shift system: **8–10 hours per day, 6 days per week**  
 - Accommodation:  
   - utility bill payment: **550 PLN per month**, or  
@@ -61,7 +61,7 @@
 
 ## What we can offer you
 
-- **Rate from 31.00 PLN gross** per hour (contract of mandate)  
+- **Rate from 31.50 PLN gross** per hour (contract of mandate)  
 - Work in shift system: **8–10 hours per day, 6 days per week**  
 - **Accommodation**:  
   - utility bill payment: **550 PLN per month**  
@@ -106,7 +106,7 @@
 
 ## What we can offer you
 
-- **Rate from 32.00 PLN gross** per hour (contract of mandate)  
+- **Rate from 33.00 PLN gross** per hour (contract of mandate)  
 - Work in shift system: **8–10 hours per day, 6 days per week**  
 - **Accommodation:**  
   - utility bill payment: **550 PLN per month**  
@@ -156,7 +156,7 @@
 - **Rate 36.00 PLN gross** per hour (contract of mandate)  
 - **Bonuses** for work efficiency and results  
 - **Free lunches**  
-- **Accommodation**: utility bill payment 400 PLN with free transportation to work  
+- **Accommodation**: utility bill payment 550 PLN with free transportation to work  
 - **Bonus 1.00 PLN gross** per hour with own accommodation  
 - **Bonus 0.40 PLN gross** per hour for own transportation to work  
 - **Opportunity for further development** in company structures (to senior Foreman, Coordinator)  
