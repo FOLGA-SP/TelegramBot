@@ -17,7 +17,7 @@
 
 ## Co możemy Ci zaoferować
 
-- **Stawka od 33,00 zł brutto** za godzinę (umowa zlecenie)  
+- **Stawka od 34,00 zł brutto** za godzinę (umowa zlecenie)  
 - Praca w systemie zmianowym: **8–10 godzin dziennie, 6 dni w tygodniu**  
 - Zakwaterowanie:  
   - opłata za rachunki: **550 zł miesięcznie**, lub  
@@ -61,7 +61,7 @@
 
 ## Co możemy Tobie zaoferować
 
-- **Stawka od 31,00 zł brutto** za godzinę (umowa zlecenie)  
+- **Stawka od 31,50 zł brutto** za godzinę (umowa zlecenie)  
 - Praca w systemie zmianowym: **8–10 godzin dziennie, 6 dni w tygodniu**  
 - **Zakwaterowanie**:  
   - opłata za rachunki: **550 zł miesięcznie**  
@@ -106,7 +106,7 @@
 
 ## Co możemy Tobie zaoferować
 
-- **Stawka od 32,00 zł brutto** za godzinę (umowa zlecenie)  
+- **Stawka od 33,00 zł brutto** za godzinę (umowa zlecenie)  
 - Praca w systemie zmianowym: **8–10 godzin dziennie, 6 dni w tygodniu**  
 - **Zakwaterowanie:**  
   - opłata za rachunki: **550 zł miesięcznie**  
@@ -189,7 +189,7 @@
 - **Grafik pracy:** 8–12 godzin dziennie, 6 dni w tygodniu  
 - **Gorący, bezpłatny obiad** na miejscu podczas przerwy obiadowej  
 - **Zakwaterowanie:**  
-  - rachunki: **400 zł miesięcznie**  
+  - opłata za rachunki: **550 zł miesięcznie**  
   - w pobliżu miejsca pracy, dostępne pieszo, bez konieczności transportu  
 - **Dopłaty:**  
   - **2,00 zł brutto** do każdej przepracowanej godziny przy własnym zakwaterowaniu  
